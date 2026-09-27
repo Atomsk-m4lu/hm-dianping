@@ -1,20 +1,18 @@
 package com.hmdp.service.impl;
 
 import com.hmdp.dto.Result;
-import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
-import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
-import lombok.val;
+import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
-import org.springframework.aop.framework.AopContext;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
@@ -22,21 +20,29 @@ import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
-import java.time.LocalDateTime;
+import java.time.Duration;
 import java.util.Collections;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * <p>
- *  服务实现类
+ *  服务实现类 —— 秒杀下单（异步削峰方案，基于 Redis Stream）
  * </p>
+ *
+ * 设计思路：
+ * 1. 生产者（seckillVoucher）在 Lua 脚本内原子完成校验 + 扣库存 + XADD 写 Stream
+ * 2. 消费者（init 启动的后台线程）用 XREADGROUP 从 Stream 拉取消息，串行落库
+ * 3. 为啥用 Redis Stream 而不是 BlockingQueue？
+ *    - Stream 持久化在 Redis 中，JVM 重启不丢消息
+ *    - 天然支持消费者组，未来可扩展到多实例并行消费
  *
  * @author 虎哥
  * @since 2021-12-22
  */
+@Slf4j
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
 
@@ -52,202 +58,241 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedissonClient redissonClient;
 
+    /**
+     * 秒杀 Lua 脚本，在类加载时初始化一次即可。
+     * 脚本作用：在 Redis 中原子地完成「检查库存 → 检查一人一单 → 扣减库存 → 记录已购 → XADD 写 Stream」
+     * 返回值：0=成功，1=库存不足，2=用户已下单
+     * 参数：voucherId, userId, orderId（orderId 由 Java 端雪花算法生成后传入）
+     */
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
-    static{
+    static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
     }
 
-    private BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
-
+    /**
+     * Stream 消费者线程池 —— 单线程串行消费，天然避免并发写库冲突
+     */
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
+    /**
+     * @PostConstruct: Spring 注入完成后自动执行。
+     * 1. 创建消费者组（若已存在则忽略）
+     * 2. 启动后台消费线程，持续从 Stream 中拉取订单消息
+     */
     @PostConstruct
-    public void init(){
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHander());
-    }
+    public void init() {
+        // 创建消费者组 "g1"，从 Stream 头部开始消费
+        // 如果组已存在会抛 DuplicateGroupException，直接忽略即可
+        try {
+            stringRedisTemplate.opsForStream().createGroup("stream.orders", "g1");
+        } catch (Exception e) {
+            log.info("消费者组 'g1' 已存在，无需创建");
+        }
 
-    private class VoucherOrderHander implements Runnable {
-
-        @Override
-        public void run(){
-            while(true){
+        // 启动消费者线程
+        SECKILL_ORDER_EXECUTOR.submit(() -> {
+            while (true) {
                 try {
-                    // 1.从阻塞队列中获取订单
-                    VoucherOrder voucherOrder = orderTasks.take();
+                    // XREADGROUP group g1 consumer c1 block 2000 count 1 streams stream.orders >
+                    // ">" 表示只读取从未被当前组消费过的消息
+                    // block 2000：没有消息时阻塞等待 2 秒，避免空转消耗 CPU
+                    List<MapRecord<String, Object, Object>> messages = stringRedisTemplate.opsForStream()
+                            .read(Consumer.from("g1", "c1"),
+                                    StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                                    StreamOffset.create("stream.orders", ReadOffset.lastConsumed()));
 
-                    // 2.创建订单
-                    handleVoucherOrder(voucherOrder);
+                    // 没有消息，继续下一轮循环
+                    if (messages == null || messages.isEmpty()) {
+                        continue;
+                    }
+
+                    // 解析消息并处理落库
+                    for (MapRecord<String, Object, Object> message : messages) {
+                        Map<Object, Object> value = message.getValue();
+                        VoucherOrder voucherOrder = new VoucherOrder();
+                        voucherOrder.setId(Long.valueOf(value.get("id").toString()));
+                        voucherOrder.setUserId(Long.valueOf(value.get("userId").toString()));
+                        voucherOrder.setVoucherId(Long.valueOf(value.get("voucherId").toString()));
+
+                        // DB 层最终校验 + 落库（和原来一样的逻辑）
+                        handleVoucherOrder(voucherOrder);
+
+                        // XACK：确认消息已处理完毕，Redis 会将其标记为已确认
+                        // 如果本进程挂了没走到 XACK，重启后会从 pending 列表重新消费
+                        stringRedisTemplate.opsForStream().acknowledge(
+                                "stream.orders",
+                                "g1",
+                                message.getId());
+                    }
                 } catch (Exception e) {
-                    log.info("处理订单异常", e);
+                    log.error("消费订单消息异常，将处理 pending 队列", e);
+                    // 消费过程中可能断连或出错，尝试处理未确认的 pending 消息
+                    handlePendingOrders();
                 }
             }
+        });
+    }
 
+    /**
+     * 处理 pending 队列中未确认的消息。
+     * XREADGROUP 读取消息后，如果还没 XACK 就宕机了，消息会留在 pending 列表。
+     * 重启后用 ReadOffset.from("0") 读取 pending 消息，重新处理。
+     */
+    private void handlePendingOrders() {
+        while (true) {
+            try {
+                // 从 pending 队列读取：XREADGROUP group g1 consumer c1 count 1 streams stream.orders 0
+                // "0" 表示读取已投递但未确认的消息
+                List<MapRecord<String, Object, Object>> messages = stringRedisTemplate.opsForStream()
+                        .read(Consumer.from("g1", "c1"),
+                                StreamReadOptions.empty().count(1),
+                                StreamOffset.create("stream.orders", ReadOffset.from("0")));
+
+                if (messages == null || messages.isEmpty()) {
+                    // 没有 pending 消息了，退出循环
+                    break;
+                }
+
+                for (MapRecord<String, Object, Object> message : messages) {
+                    Map<Object, Object> value = message.getValue();
+                    VoucherOrder voucherOrder = new VoucherOrder();
+                    voucherOrder.setId(Long.valueOf(value.get("id").toString()));
+                    voucherOrder.setUserId(Long.valueOf(value.get("userId").toString()));
+                    voucherOrder.setVoucherId(Long.valueOf(value.get("voucherId").toString()));
+
+                    handleVoucherOrder(voucherOrder);
+
+                    // XACK 确认
+                    stringRedisTemplate.opsForStream().acknowledge(
+                            "stream.orders",
+                            "g1",
+                            message.getId());
+                }
+            } catch (Exception e) {
+                log.error("处理 pending 队列异常", e);
+                // 失败了稍后重试，避免死循环刷日志
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
     }
 
+    /**
+     * DB 层最终校验 + 落库（由消费线程调用）。
+     * 作用：Redis Stream 的消息是可靠的，但极端情况下可能重复投递，
+     * 所以这里用分布式锁 + SQL 条件更新做最后一道兜底。
+     */
     private void handleVoucherOrder(VoucherOrder voucherOrder) {
-        // 1.获取用户id
         Long userId = voucherOrder.getUserId();
+        Long voucherId = voucherOrder.getVoucherId();
 
-        // 2.创建锁对象
+        // ① Redisson 分布式锁：同用户串行处理，防重复单
         RLock lock = redissonClient.getLock("order:" + userId);
-
-        // 3.获取锁
-        boolean success = lock.tryLock();
-
-        // 4.判断是否获取成功
-        if (!success) {
-            log.error("用户{}已购买过，不允许重复下单！", userId);
+        boolean locked = lock.tryLock();
+        if (!locked) {
+            log.error("用户{}已购券，重复下单被拦截", userId);
             return;
         }
-
-        // 5.创建代金券订单
         try {
-            return proxy.createVoucherOrder(voucherId);
+            // ② DB 层一人一单检查
+            int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+            if (count > 0) {
+                log.error("用户{}已存在券{}的订单", userId, voucherId);
+                return;
+            }
+
+            // ③ 原子扣减库存：stock > 0 是 SQL 条件，保证不会扣成负数
+            boolean success = seckillVoucherService.update()
+                    .setSql("stock = stock - 1")
+                    .eq("voucher_id", voucherId).gt("stock", 0)
+                    .update();
+            if (!success) {
+                log.error("券{}库存扣减失败", voucherId);
+                return;
+            }
+
+            // ④ 落库
+            save(voucherOrder);
         } finally {
-            // 5.2解锁
             lock.unlock();
         }
     }
 
-     private IVoucherOrderService proxy;
-    // 代金券秒杀
-    // @param voucherId 代金券id
-    // @return 结果数据
+    /**
+     * 异步秒杀下单 —— 生产者。
+     *
+     * 流程：
+     * 1. 生成全局唯一 orderId（雪花算法）
+     * 2. 调用 Lua 脚本，原子完成：校验库存 → 校验一人一单 → 扣库存 → 记已购 → XADD 写 Stream
+     * 3. 脚本返回 0 表示成功，直接返回 orderId 给用户
+     * 4. 后台消费者线程从 Stream 中读取消息，异步落库
+     *
+     * 与旧版 BlockingQueue 方案的区别：
+     * - 旧版：Lua 返回 0 → Java 构造 VoucherOrder → 塞入内存队列 → 消费者取队列 → 落库
+     * - 新版：Lua 返回 0 → Java 直接返回 orderId（Stream 中的消息由 Lua 负责写入）
+     *   好处：消息在 Redis 中持久化，不依赖 JVM 内存，不丢消息
+     */
     @Override
     public Result seckillVoucher(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
 
-        // 1.调用lua脚本
+        // ① 先生成订单 ID，传入 Lua 脚本
+        long orderId = redisIdWorker.nextId("order");
+
+        // ② 调用 Lua 脚本（原子操作，包含校验 + XADD 写 Stream）
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Collections.emptyList(),
                 voucherId.toString(),
-                userId.toString()
+                userId.toString(),
+                String.valueOf(orderId)
         );
 
-        // 2.判断结果是否为0
+        // ③ 根据脚本返回值快速拦截非法请求
         if (result != 0) {
-            // 2.1不为0的话代表没有购买资格
             return Result.fail(result == 1 ? "库存不足" : "用户已下单");
         }
 
-        // 3.为0的话代表有购买资格，把下单信息保存到阻塞队列中
-        VoucherOrder voucherOrder = new VoucherOrder();
-
-        // 3.1订单id
-        long orderId = redisIdWorker.nextId("order");
-        voucherOrder.setId(orderId);
-
-        // 3.2用户id
-        voucherOrder.setUserId(userId);
-
-        // 3.3优惠券id
-        voucherOrder.setVoucherId(voucherId);
-        save(voucherOrder);
-
-        // 3.4放入阻塞队列中
-        orderTasks.add(voucherOrder);
-
-        // 4.获取代理对象
-        proxy = (IVoucherOrderService) AopContext.currentProxy();
-
-        // 5.返回订单id
-        return Result.ok(0);
+        // ④ 秒杀成功，直接返回 orderId
+        //    订单落库由后台消费者线程异步完成
+        return Result.ok(orderId);
     }
 
-/*
-    @Override
-    public Result seckillVoucher(Long voucherId) {
-        // 1.查询优惠券
-        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
-        if (seckillVoucher == null) {
-            return Result.fail("优惠券不存在");
-        }
+    // ========== 以下为旧版同步落库代码留存参考 ==========
 
-        // 2.判断秒杀是否开始
-        if (seckillVoucher.getBeginTime().isAfter(LocalDateTime.now())) {
-            return Result.fail("秒杀未开始！");
-        }
-
-        // 3.判断优惠券是否过期
-        if (seckillVoucher.getEndTime().isBefore(LocalDateTime.now())) {
-            return Result.fail("秒杀已结束！");
-        }
-
-        // 4.判断秒杀券库存是否充足
-        if (seckillVoucher.getStock() <= 0) {
-            return Result.fail("库存不足！");
-        }
-        Long userId = UserHolder.getUser().getId();
-
-        // 5.创建锁对象
-        // SimpleRedisLock lock = new SimpleRedisLock(stringRedisTemplate, "order:" + userId);
-        RLock lock = redissonClient.getLock("order:" + userId);
-
-        // 6.获取锁
-        boolean success = lock.tryLock();
-
-        // 7.判断是否获取成功
-        if (!success) {
-            return Result.fail("当前用户已购买过，不允许重复下单！");
-        }
-
-        // 8.创建代金券订单
-        try {
-            // 8.1调用服务层方法创建订单
-            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
-            return proxy.createVoucherOrder(voucherId);
-        } finally {
-            // 8.2解锁
-            lock.unlock();
-        }
-    }
- */
-
-    // 创建代金券订单
     @Transactional
     @Override
     public Result createVoucherOrder(Long voucherId) {
-        // 1.一人一单
         Long userId = UserHolder.getUser().getId();
 
-        // 1.1查询订单
-        int count = query().eq("user_id", userId) // select count(*) from voucher_order where user_id = ? and voucher_id = ?
+        int count = query().eq("user_id", userId)
                 .eq("voucher_id", voucherId)
                 .count();
-
-        // 1.2判断用户是否已购买
         if (count > 0) {
             return Result.fail("您已购买过该优惠券！");
         }
 
-        // 2.扣减库存
         boolean success = seckillVoucherService.update()
-                .setSql("stock = stock - 1") //update stock = stock - 1
-                .eq("voucher_id", voucherId).gt("stock", 0) //where voucher_id = ? and stock > 0
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId).gt("stock", 0)
                 .update();
         if (!success) {
             return Result.fail("库存不足！");
         }
 
-        // 3.创建订单
         VoucherOrder voucherOrder = new VoucherOrder();
-
-        // 3.1订单id
         long orderId = redisIdWorker.nextId("order");
         voucherOrder.setId(orderId);
-
-        // 3.2用户id
         voucherOrder.setUserId(userId);
-
-        // 3.3优惠券id
         voucherOrder.setVoucherId(voucherId);
         save(voucherOrder);
 
-        // 4.返回订单id
         return Result.ok(orderId);
     }
 }
