@@ -154,7 +154,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         String idStr = StrUtil.join(",", ids);
         List<Shop> shops = query().in("id", ids)
                 .last("ORDER BY FIELD(id, " + idStr + ")").list();
-        shops.forEach(shop -> shop.setDistance(distanceMap.get(shop.getId().toString()).getValue()));
+        shops.forEach(shop -> {
+            Distance dist = distanceMap.get(shop.getId().toString());
+            if (dist != null) {
+                shop.setDistance(dist.getValue());
+            }
+        });
 
         // 6.去重（防止Redis GEO中有重复member）
         List<Shop> distinctShops = shops.stream()

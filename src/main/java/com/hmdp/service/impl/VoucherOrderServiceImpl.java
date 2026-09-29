@@ -136,8 +136,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                                 message.getId());
                     }
                 } catch (Exception e) {
+                    if (!running) break;
                     log.error("消费订单消息异常，将处理 pending 队列", e);
-                    // 消费过程中可能断连或出错，尝试处理未确认的 pending 消息
                     handlePendingOrders();
                 }
             }
@@ -180,8 +180,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                             message.getId());
                 }
             } catch (Exception e) {
+                if (!running) break;
                 log.error("处理 pending 队列异常", e);
-                // 失败了稍后重试，避免死循环刷日志
                 try {
                     Thread.sleep(50);
                 } catch (InterruptedException ex) {

@@ -259,11 +259,8 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                 .list();
 
         for(Blog blog : blogList){
-            // 查询跟blog关联的用户
             queryBlogUserInfo(blog);
-
-            // 查询blog是否被点赞过
-            isBlogLiked(userId, blog);
+            isBlogLiked(blog.getId(), blog);
         }
 
         // 6.封装并返回
@@ -281,8 +278,16 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
      */
     private void queryBlogUserInfo(Blog blog) {
         Long userId = blog.getUserId();
+        if (userId == null) {
+            blog.setName("匿名用户");
+            return;
+        }
         User user = userService.getById(userId);
-        blog.setName(user.getNickName());
-        blog.setIcon(user.getIcon());
+        if (user != null) {
+            blog.setName(user.getNickName());
+            blog.setIcon(user.getIcon());
+        } else {
+            blog.setName("用户已注销");
+        }
     }
 }

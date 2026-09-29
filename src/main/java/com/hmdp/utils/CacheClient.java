@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
+import jakarta.annotation.PreDestroy;
 import jakarta.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.concurrent.ExecutorService;
@@ -22,8 +23,20 @@ public class CacheClient {
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
-    // 线程池（用于异步缓存重建）
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+
+    @PreDestroy
+    public void destroy() {
+        CACHE_REBUILD_EXECUTOR.shutdown();
+        try {
+            if (!CACHE_REBUILD_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
+                CACHE_REBUILD_EXECUTOR.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            CACHE_REBUILD_EXECUTOR.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
 
     /**
      * 写入缓存（普通过期时间）
