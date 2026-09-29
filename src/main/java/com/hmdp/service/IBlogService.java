@@ -41,4 +41,11 @@ public interface IBlogService extends IService<Blog> {
      * @return 点赞数量
      */
     Result getBlogLikes(Long id);
+
+    /**
+     * 新增探店博文
+     * @param blog 探店博文
+     * @return 探店博文id
+     */
+    Result saveBlog(Blog blog);
 }
