@@ -18,8 +18,9 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.Resource;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.annotation.Resource;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
@@ -76,6 +77,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
+    private volatile boolean running = true;
+
+    @PreDestroy
+    public void destroy() {
+        running = false;
+        SECKILL_ORDER_EXECUTOR.shutdownNow();
+    }
+
     /**
      * @PostConstruct: Spring 注入完成后自动执行。
      * 1. 创建消费者组（若已存在则忽略）
@@ -93,7 +102,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
         // 启动消费者线程
         SECKILL_ORDER_EXECUTOR.submit(() -> {
-            while (true) {
+            while (running) {
                 try {
                     // XREADGROUP group g1 consumer c1 block 2000 count 1 streams stream.orders >
                     // ">" 表示只读取从未被当前组消费过的消息
@@ -141,7 +150,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 重启后用 ReadOffset.from("0") 读取 pending 消息，重新处理。
      */
     private void handlePendingOrders() {
-        while (true) {
+        while (running) {
             try {
                 // 从 pending 队列读取：XREADGROUP group g1 consumer c1 count 1 streams stream.orders 0
                 // "0" 表示读取已投递但未确认的消息
@@ -201,7 +210,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         try {
             // ② DB 层一人一单检查
-            int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+            long count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
             if (count > 0) {
                 log.error("用户{}已存在券{}的订单", userId, voucherId);
                 return;
@@ -271,7 +280,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     public Result createVoucherOrder(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
 
-        int count = query().eq("user_id", userId)
+        long count = query().eq("user_id", userId)
                 .eq("voucher_id", voucherId)
                 .count();
         if (count > 0) {

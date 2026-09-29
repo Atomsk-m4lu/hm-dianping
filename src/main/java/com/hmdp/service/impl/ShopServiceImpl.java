@@ -10,18 +10,18 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.SystemConstants;
-import org.springframework.data.geo.Circle;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
 import org.springframework.data.geo.Point;
 import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.Resource;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.Resource;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -124,11 +124,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         // 3.查询redis，按照距离排序、分页。结果：shopId,distance
         String key = RedisConstants.SHOP_GEO_KEY + typeId;
-        Circle circle = new Circle(new Point(x, y), new Distance(5000));
         GeoResults<RedisGeoCommands.GeoLocation<String>> results =
-                stringRedisTemplate.opsForGeo().radius(
-                        key, circle,
-                        RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+                stringRedisTemplate.opsForGeo().search(
+                        key,
+                        GeoReference.fromCoordinate(x, y),
+                        new Distance(5000),
+                        RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs()
                                 .includeDistance()
                                 .limit(end)
                 );

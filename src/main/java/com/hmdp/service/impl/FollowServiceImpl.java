@@ -15,7 +15,7 @@ import lombok.val;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
-import javax.annotation.Resource;
+import jakarta.annotation.Resource;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -83,7 +83,7 @@ public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> impleme
         Long userId = UserHolder.getUser().getId();
 
         // 2.查询是否关注
-        Integer count = query()
+        Long count = query()
                 .eq("user_id", userId)
                 .eq("follow_user_id", followUserId)
                 .count();
