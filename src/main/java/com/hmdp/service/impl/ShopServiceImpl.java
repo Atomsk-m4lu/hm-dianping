@@ -1,17 +1,30 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.util.StrUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
+import org.springframework.data.geo.Circle;
+import org.springframework.data.geo.Distance;
+import org.springframework.data.geo.GeoResult;
+import org.springframework.data.geo.GeoResults;
+import org.springframework.data.geo.Point;
+import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -59,5 +72,29 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         updateById(shop);
         stringRedisTemplate.delete(RedisConstants.CACHE_SHOP_KEY + shopId);
         return Result.ok();
+    }
+
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        // 1.判断是否需要根据坐标查询
+        if (x == null || y == null) {
+            // 不需要坐标查询，按数据库查询
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            return Result.ok(page.getRecords());
+        }
+
+        // 2.计算分页参数
+
+        // 3.查询redis，按照距离排序、分页。结果：shopId,distance
+
+        // 4.解析出id
+
+        // 5.根据id查询商铺信息
+
+
+        // 6.返回结果
+        return Result.ok(shops);
     }
 }

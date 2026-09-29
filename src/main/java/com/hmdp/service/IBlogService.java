@@ -48,4 +48,6 @@ public interface IBlogService extends IService<Blog> {
      * @return 探店博文id
      */
     Result saveBlog(Blog blog);
+
+    Result queryFollowBlog(Long max, Integer offset);
 }

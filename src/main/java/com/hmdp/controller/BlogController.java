@@ -75,7 +75,7 @@ public class BlogController {
 
     /**
      * 根据用户查询探店博文
-     * @param userId 用户id
+     * @param id 用户id
      * @return 探店博文
      */
     @GetMapping("/of/user")
@@ -88,5 +88,10 @@ public class BlogController {
         // 获取当前页数据
         List<Blog> records = page.getRecords();
         return Result.ok(records);
+    }
+
+    @GetMapping("/of/follow")
+    public Result queryFollowBlog(@RequestParam("lastId") Long max, @RequestParam(name = "offset", defaultValue = "0") Integer offset) {
+        return blogService.queryFollowBlog(max, offset);
     }
 }
