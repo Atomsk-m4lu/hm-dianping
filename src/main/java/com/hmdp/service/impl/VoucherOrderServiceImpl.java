@@ -17,6 +17,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -58,6 +59,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Resource
     private RedissonClient redissonClient;
+
+    @Resource
+    private TransactionTemplate transactionTemplate;
 
     /**
      * 秒杀 Lua 脚本，在类加载时初始化一次即可。
@@ -104,20 +108,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_ORDER_EXECUTOR.submit(() -> {
             while (running) {
                 try {
-                    // XREADGROUP group g1 consumer c1 block 2000 count 1 streams stream.orders >
-                    // ">" 表示只读取从未被当前组消费过的消息
-                    // block 2000：没有消息时阻塞等待 2 秒，避免空转消耗 CPU
                     List<MapRecord<String, Object, Object>> messages = stringRedisTemplate.opsForStream()
                             .read(Consumer.from("g1", "c1"),
                                     StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
                                     StreamOffset.create("stream.orders", ReadOffset.lastConsumed()));
 
-                    // 没有消息，继续下一轮循环
                     if (messages == null || messages.isEmpty()) {
                         continue;
                     }
 
-                    // 解析消息并处理落库
                     for (MapRecord<String, Object, Object> message : messages) {
                         Map<Object, Object> value = message.getValue();
                         VoucherOrder voucherOrder = new VoucherOrder();
@@ -125,20 +124,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                         voucherOrder.setUserId(Long.valueOf(value.get("userId").toString()));
                         voucherOrder.setVoucherId(Long.valueOf(value.get("voucherId").toString()));
 
-                        // DB 层最终校验 + 落库（和原来一样的逻辑）
                         handleVoucherOrder(voucherOrder);
 
-                        // XACK：确认消息已处理完毕，Redis 会将其标记为已确认
-                        // 如果本进程挂了没走到 XACK，重启后会从 pending 列表重新消费
                         stringRedisTemplate.opsForStream().acknowledge(
                                 "stream.orders",
                                 "g1",
                                 message.getId());
                     }
                 } catch (Exception e) {
-                    if (!running) break;
-                    log.error("消费订单消息异常，将处理 pending 队列", e);
-                    handlePendingOrders();
+                    if (isShuttingDown(e)) break;
+                    log.error("消费订单消息异常", e);
                 }
             }
         });
@@ -152,15 +147,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private void handlePendingOrders() {
         while (running) {
             try {
-                // 从 pending 队列读取：XREADGROUP group g1 consumer c1 count 1 streams stream.orders 0
-                // "0" 表示读取已投递但未确认的消息
                 List<MapRecord<String, Object, Object>> messages = stringRedisTemplate.opsForStream()
                         .read(Consumer.from("g1", "c1"),
                                 StreamReadOptions.empty().count(1),
                                 StreamOffset.create("stream.orders", ReadOffset.from("0")));
 
                 if (messages == null || messages.isEmpty()) {
-                    // 没有 pending 消息了，退出循环
                     break;
                 }
 
@@ -173,14 +165,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
                     handleVoucherOrder(voucherOrder);
 
-                    // XACK 确认
                     stringRedisTemplate.opsForStream().acknowledge(
                             "stream.orders",
                             "g1",
                             message.getId());
                 }
             } catch (Exception e) {
-                if (!running) break;
+                if (isShuttingDown(e)) break;
                 log.error("处理 pending 队列异常", e);
                 try {
                     Thread.sleep(50);
@@ -192,6 +183,22 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
+    private boolean isShuttingDown(Exception e) {
+        if (!running) return true;
+        Throwable t = e;
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("STOPPING")
+                    || msg.contains("destroyed")
+                    || msg.contains("Connection closed")
+                    || msg.contains("Connection refused"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
     /**
      * DB 层最终校验 + 落库（由消费线程调用）。
      * 作用：Redis Stream 的消息是可靠的，但极端情况下可能重复投递，
@@ -201,7 +208,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long userId = voucherOrder.getUserId();
         Long voucherId = voucherOrder.getVoucherId();
 
-        // ① Redisson 分布式锁：同用户串行处理，防重复单
         RLock lock = redissonClient.getLock("order:" + userId);
         boolean locked = lock.tryLock();
         if (!locked) {
@@ -209,25 +215,26 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return;
         }
         try {
-            // ② DB 层一人一单检查
-            long count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
-            if (count > 0) {
-                log.error("用户{}已存在券{}的订单", userId, voucherId);
-                return;
-            }
+            transactionTemplate.executeWithoutResult(status -> {
+                long count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+                if (count > 0) {
+                    log.error("用户{}已存在券{}的订单", userId, voucherId);
+                    status.setRollbackOnly();
+                    return;
+                }
 
-            // ③ 原子扣减库存：stock > 0 是 SQL 条件，保证不会扣成负数
-            boolean success = seckillVoucherService.update()
-                    .setSql("stock = stock - 1")
-                    .eq("voucher_id", voucherId).gt("stock", 0)
-                    .update();
-            if (!success) {
-                log.error("券{}库存扣减失败", voucherId);
-                return;
-            }
+                boolean success = seckillVoucherService.update()
+                        .setSql("stock = stock - 1")
+                        .eq("voucher_id", voucherId).gt("stock", 0)
+                        .update();
+                if (!success) {
+                    log.error("券{}库存扣减失败", voucherId);
+                    status.setRollbackOnly();
+                    return;
+                }
 
-            // ④ 落库
-            save(voucherOrder);
+                save(voucherOrder);
+            });
         } finally {
             lock.unlock();
         }
