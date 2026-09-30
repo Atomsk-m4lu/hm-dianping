@@ -12,6 +12,7 @@ import com.hmdp.mapper.UserMapper;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RegexUtils;
+import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -20,6 +21,9 @@ import org.springframework.stereotype.Service;
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpSession;
 
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -111,6 +115,68 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 9. 返回token
         return Result.ok(token);
 
+    }
+
+    // 签到功能
+    @Override
+    public Result sign() {
+        // 1. 获取登录用户
+        Long userId = UserHolder.getUser().getId();
+
+        // 2. 获取当前时间
+        LocalDateTime now = LocalDateTime.now();
+
+        // 3. 拼接key
+        String keySuffix = now.format(DateTimeFormatter.ofPattern("yyyy/MM"));
+        String key = RedisConstants.USER_SIGN_KEY + userId + ":" + keySuffix;
+
+        // 4. 获取今天是这个月的第几天
+        int dayOfMonth = now.getDayOfMonth();
+
+        // 5. 写入redis
+        stringRedisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+
+        // 6. 返回ok
+        return Result.ok();
+    }
+
+    // 统计连续签到天数
+    @Override
+    public Result signCount() {
+        // 1. 获取登录用户
+        Long userId = UserHolder.getUser().getId();
+
+        // 2. 获取今天日期
+        LocalDate today = LocalDate.now();
+
+        // 3. 初始化连续签到计数
+        int count = 0;
+
+        // 4. 从今天开始，向前逐天检查签到记录
+        LocalDate date = today;
+        while (true) {
+            // 4.1 拼接当前日期对应的key（按月存）
+            String keySuffix = date.format(DateTimeFormatter.ofPattern("yyyy/MM"));
+            String key = RedisConstants.USER_SIGN_KEY + userId + ":" + keySuffix;
+
+            // 4.2 获取当天在BitMap中的偏移量（从0开始）
+            int dayOfMonth = date.getDayOfMonth();
+
+            // 4.3 检查该位是否为1
+            Boolean signed = stringRedisTemplate.opsForValue().getBit(key, dayOfMonth - 1);
+
+            if (signed == null || !signed) {
+                // 未签到，结束循环
+                break;
+            }
+
+            // 已签到，计数+1，继续检查前一天
+            count++;
+            date = date.minusDays(1);
+        }
+
+        // 5. 返回连续签到天数
+        return Result.ok(count);
     }
 
     private User createUserWithPhone(String phone) {

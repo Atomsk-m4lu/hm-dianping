@@ -108,4 +108,23 @@ public class UserController {
         // 返回
         return Result.ok(userDTO);
     }
+
+    /**
+     * 签到功能
+     * @return 无
+     */
+    @PostMapping("/sign")
+    public Result sign(){
+        // 实现签到功能
+        return userService.sign();
+    }
+
+    /**
+     * 统计连续签到天数
+     * @return 连续签到天数
+     */
+    @GetMapping("/sign/count")
+    public Result signCount(){
+        return userService.signCount();
+    }
 }
